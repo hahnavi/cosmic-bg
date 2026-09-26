@@ -14,6 +14,28 @@ pub const BACKGROUNDS: &str = "backgrounds";
 pub const DEFAULT_BACKGROUND: &str = "all";
 pub const SAME_ON_ALL: &str = "same-on-all";
 
+/// Returns the cosmic-config storage key for an output.
+/// "all" is stored as "all", while a specific output like "DP-1" is stored as "output.DP-1".
+#[must_use]
+pub fn output_storage_key(output: &str) -> String {
+    if output == "all" {
+        "all".to_string()
+    } else {
+        format!("output.{output}")
+    }
+}
+
+/// Parses a storage key into an output name.
+/// "all" returns Some("all"), "output.DP-1" returns Some("DP-1"), others return None.
+#[must_use]
+pub fn parse_output_storage_key(key: &str) -> Option<&str> {
+    if key == "all" {
+        Some("all")
+    } else {
+        key.strip_prefix("output.")
+    }
+}
+
 /// Create a context to the `cosmic-bg` config.
 ///
 /// # Errors
@@ -153,7 +175,7 @@ impl Entry {
 }
 
 /// Image filtering method
-#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FilterMethod {
     // nearest neighbor filtering
     Nearest,
@@ -237,10 +259,7 @@ impl Config {
         };
 
         config.default_background = context.default_background();
-
-        if !config.same_on_all {
-            config.load_backgrounds(context);
-        }
+        config.load_backgrounds(context);
 
         Ok(config)
     }
@@ -252,7 +271,7 @@ impl Config {
         let entries = context
             .backgrounds()
             .into_iter()
-            .filter_map(|output| context.entry(&["output.", &output].concat()).ok());
+            .filter_map(|output| context.entry(&output_storage_key(&output)).ok());
 
         for entry in entries {
             self.outputs.insert(entry.output.clone());
@@ -260,6 +279,20 @@ impl Config {
         }
 
         self.default_background = context.default_background();
+    }
+
+    /// Returns the effective Entry to use for a given output.
+    /// If `same_on_all` is true, this always returns `default_background`.
+    /// If `same_on_all` is false, it returns the per-output entry if configured,
+    /// otherwise falling back to `default_background`.
+    pub fn effective_entry(&self, output_name: &str) -> Entry {
+        if self.same_on_all {
+            self.default_background.clone()
+        } else if let Some(entry) = self.entry(output_name) {
+            entry.clone()
+        } else {
+            self.default_background.clone()
+        }
     }
 
     /// Get the entry for a given output.
@@ -286,31 +319,109 @@ impl Config {
         context: &Context,
         entry: Entry,
     ) -> Result<(), cosmic_config::Error> {
-        let output_key = if entry.output == "all" {
-            entry.output.clone()
-        } else {
-            self.outputs.insert(entry.output.clone());
-            ["output.", &entry.output].concat()
-        };
+        let is_all = entry.output == "all";
+        let output_key = output_storage_key(&entry.output);
 
         if context.0.get(&output_key).ok().as_ref() != Some(&entry) {
             context.0.set(&output_key, entry.clone())?;
         }
 
-        if let Some(old) = self.entry_mut(&output_key) {
-            *old = entry;
-        } else if entry.output != "all" {
-            self.backgrounds.push(entry);
+        if is_all {
+            self.default_background = entry;
+        } else {
+            self.outputs.insert(entry.output.clone());
+            if let Some(old) = self.entry_mut(&entry.output) {
+                *old = entry;
+            } else {
+                self.backgrounds.push(entry);
+            }
         }
 
-        let new_value = self.outputs.iter().cloned().collect::<Vec<_>>();
+        let mut new_value = self.outputs.iter().cloned().collect::<Vec<_>>();
+        new_value.sort();
 
-        if context.backgrounds() != new_value
+        let mut cur_backgrounds = context.backgrounds();
+        cur_backgrounds.sort();
+
+        if cur_backgrounds != new_value
             && let Err(why) = context.0.set::<Vec<String>>(BACKGROUNDS, new_value)
         {
             tracing::error!(?why, "failed to update outputs");
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_storage_key_conversions() {
+        assert_eq!(output_storage_key("all"), "all");
+        assert_eq!(output_storage_key("DP-1"), "output.DP-1");
+        assert_eq!(output_storage_key("HDMI-A-1"), "output.HDMI-A-1");
+
+        assert_eq!(parse_output_storage_key("all"), Some("all"));
+        assert_eq!(parse_output_storage_key("output.DP-1"), Some("DP-1"));
+        assert_eq!(parse_output_storage_key("other"), None);
+    }
+
+    #[test]
+    fn test_effective_entry_selection() {
+        let default_entry = Entry::new("all".into(), Source::Color(Color::Single([0.1, 0.2, 0.3])));
+        let dp1_entry = Entry::new("DP-1".into(), Source::Color(Color::Single([0.4, 0.5, 0.6])));
+
+        let mut config = Config {
+            same_on_all: true,
+            default_background: default_entry.clone(),
+            backgrounds: vec![dp1_entry.clone()],
+            outputs: [String::from("DP-1")].into_iter().collect(),
+        };
+
+        // When same_on_all is true, all outputs get default_background
+        assert_eq!(config.effective_entry("DP-1"), default_entry);
+        assert_eq!(config.effective_entry("HDMI-1"), default_entry);
+
+        // When same_on_all is false, configured outputs get their entry
+        config.same_on_all = false;
+        assert_eq!(config.effective_entry("DP-1"), dp1_entry);
+        // Unconfigured outputs fall back to default_background
+        assert_eq!(config.effective_entry("HDMI-1"), default_entry);
+    }
+
+    #[test]
+    fn test_set_entry_in_memory_updates() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        // Safe in tests: set XDG_CONFIG_HOME to tempdir so cosmic-config writes there
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        }
+
+        let ctx = context().unwrap();
+        let mut config = Config::default();
+
+        let entry1 = Entry::new("DP-1".into(), Source::Color(Color::Single([1.0, 0.0, 0.0])));
+        config.set_entry(&ctx, entry1.clone()).unwrap();
+
+        assert_eq!(config.backgrounds.len(), 1);
+        assert_eq!(config.entry("DP-1"), Some(&entry1));
+
+        // Setting a second entry for the same output should UPDATE, not duplicate
+        let entry2 = Entry::new("DP-1".into(), Source::Color(Color::Single([0.0, 1.0, 0.0])));
+        config.set_entry(&ctx, entry2.clone()).unwrap();
+
+        assert_eq!(config.backgrounds.len(), 1, "Should not duplicate entries");
+        assert_eq!(
+            config.entry("DP-1"),
+            Some(&entry2),
+            "Should return updated value"
+        );
+
+        // Setting "all" updates default_background
+        let entry_all = Entry::new("all".into(), Source::Color(Color::Single([0.0, 0.0, 1.0])));
+        config.set_entry(&ctx, entry_all.clone()).unwrap();
+        assert_eq!(config.default_background, entry_all);
     }
 }

@@ -71,12 +71,22 @@ use wallpaper::Wallpaper;
 pub struct CosmicBgLayer {
     layer: LayerSurface,
     viewport: wp_viewport::WpViewport,
+    fractional_scale_handle: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
     wl_output: WlOutput,
     output_info: OutputInfo,
     pool: Option<SlotPool>,
     needs_redraw: bool,
     size: Option<(u32, u32)>,
     fractional_scale: Option<u32>,
+}
+
+impl Drop for CosmicBgLayer {
+    fn drop(&mut self) {
+        if let Some(scale) = self.fractional_scale_handle.take() {
+            scale.destroy();
+        }
+        self.viewport.destroy();
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -152,7 +162,6 @@ fn main() -> color_eyre::Result<()> {
                                 } else {
                                     state.config.load_backgrounds(&conf_context);
                                 }
-                                state.config.outputs.clear();
                                 changes_applied = true;
                             }
 
@@ -160,9 +169,13 @@ fn main() -> color_eyre::Result<()> {
                                 tracing::debug!(key, "key modified");
                                 if let Some(output) = key.strip_prefix("output.")
                                     && let Ok(new_entry) = conf_context.entry(key)
-                                    && let Some(existing) = state.config.entry_mut(output)
                                 {
-                                    *existing = new_entry;
+                                    if let Some(existing) = state.config.entry_mut(output) {
+                                        *existing = new_entry;
+                                    } else {
+                                        state.config.backgrounds.push(new_entry);
+                                        state.config.outputs.insert(output.to_string());
+                                    }
                                     changes_applied = true;
                                 }
                             }
@@ -199,33 +212,6 @@ fn main() -> color_eyre::Result<()> {
 
     let source_tx = img_source::img_source(&event_loop.handle());
 
-    // initial setup with all images
-    let wallpapers = {
-        let mut wallpapers = Vec::with_capacity(config.backgrounds.len() + 1);
-
-        wallpapers.extend({
-            config.backgrounds.iter().map(|bg| {
-                Wallpaper::new(
-                    bg.clone(),
-                    qh.clone(),
-                    event_loop.handle(),
-                    source_tx.clone(),
-                )
-            })
-        });
-
-        wallpapers.sort_by(|a, b| a.entry.output.cmp(&b.entry.output));
-
-        wallpapers.push(Wallpaper::new(
-            config.default_background.clone(),
-            qh.clone(),
-            event_loop.handle(),
-            source_tx.clone(),
-        ));
-
-        wallpapers
-    };
-
     let mut bg_state = CosmicBg {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
@@ -239,10 +225,13 @@ fn main() -> color_eyre::Result<()> {
         source_tx,
         loop_handle: event_loop.handle(),
         exit: false,
-        wallpapers,
+        wallpapers: Vec::new(),
         config,
         active_outputs: Vec::new(),
+        image_cache: wallpaper::ImageCache::default(),
     };
+
+    bg_state.apply_backgrounds();
 
     loop {
         event_loop.dispatch(None, &mut bg_state)?;
@@ -273,54 +262,118 @@ pub struct CosmicBg {
     wallpapers: Vec<Wallpaper>,
     config: Config,
     active_outputs: Vec<WlOutput>,
+    pub image_cache: wallpaper::ImageCache,
 }
 
 impl CosmicBg {
     fn apply_backgrounds(&mut self) {
-        self.wallpapers.clear();
+        let mut existing_layers: Vec<CosmicBgLayer> = Vec::new();
+        for wp in &mut self.wallpapers {
+            existing_layers.append(&mut wp.layers);
+        }
 
-        let mut all_wallpaper = Wallpaper::new(
-            self.config.default_background.clone(),
-            self.qh.clone(),
-            self.loop_handle.clone(),
-            self.source_tx.clone(),
-        );
-
-        let mut backgrounds = self.config.backgrounds.clone();
-        backgrounds.sort_by(|a, b| a.output.cmp(&b.output));
-
-        'outer: for output in &self.active_outputs {
-            let Some(output_info) = self.output_state.info(output) else {
-                continue;
-            };
-
-            let o_name = output_info.name.clone().unwrap_or_default();
-            for background in &backgrounds {
-                if background.output == o_name {
-                    let mut new_wallpaper = Wallpaper::new(
-                        background.clone(),
-                        self.qh.clone(),
-                        self.loop_handle.clone(),
-                        self.source_tx.clone(),
-                    );
-
-                    new_wallpaper
-                        .layers
-                        .push(self.new_layer(output.clone(), output_info));
-                    _ = new_wallpaper.save_state();
-                    self.wallpapers.push(new_wallpaper);
-
-                    continue 'outer;
+        if self.config.same_on_all {
+            let default_entry = self.config.default_background.clone();
+            self.wallpapers.retain(|w| w.entry.output == "all");
+            if self.wallpapers.is_empty() {
+                self.wallpapers.push(Wallpaper::new(
+                    default_entry,
+                    self.qh.clone(),
+                    self.loop_handle.clone(),
+                    self.source_tx.clone(),
+                ));
+            } else {
+                let wp = &mut self.wallpapers[0];
+                if wp.entry != default_entry {
+                    if wp.entry.rotation_frequency != default_entry.rotation_frequency
+                        && wp.entry.source == default_entry.source
+                        && wp.entry.scaling_mode == default_entry.scaling_mode
+                        && wp.entry.filter_method == default_entry.filter_method
+                    {
+                        wp.entry.rotation_frequency = default_entry.rotation_frequency;
+                        wp.reconcile_timer();
+                    } else {
+                        wp.entry = default_entry;
+                        wp.load_images();
+                        wp.watch_source(self.source_tx.clone());
+                        wp.clear_image();
+                    }
                 }
             }
 
-            all_wallpaper
-                .layers
-                .push(self.new_layer(output.clone(), output_info));
-        }
+            for output in &self.active_outputs {
+                let Some(output_info) = self.output_state.info(output) else {
+                    continue;
+                };
+                if let Some(pos) = existing_layers.iter().position(|l| &l.wl_output == output) {
+                    let mut layer = existing_layers.remove(pos);
+                    layer.output_info = output_info;
+                    self.wallpapers[0].layers.push(layer);
+                } else {
+                    let layer = self.new_layer(output.clone(), output_info);
+                    self.wallpapers[0].layers.push(layer);
+                }
+            }
 
-        _ = all_wallpaper.save_state();
-        self.wallpapers.push(all_wallpaper);
+            _ = self.wallpapers[0].save_state();
+            self.wallpapers[0].draw(&mut self.image_cache);
+        } else {
+            let mut new_wallpapers = Vec::new();
+
+            for output in &self.active_outputs {
+                let Some(output_info) = self.output_state.info(output) else {
+                    continue;
+                };
+                let o_name = output_info.name.clone().unwrap_or_default();
+                let target_entry = self.config.effective_entry(&o_name);
+
+                let existing_wp_idx = self
+                    .wallpapers
+                    .iter()
+                    .position(|w| w.entry.output == o_name);
+                let mut wp = if let Some(idx) = existing_wp_idx {
+                    let mut wp = self.wallpapers.remove(idx);
+                    if wp.entry != target_entry {
+                        if wp.entry.rotation_frequency != target_entry.rotation_frequency
+                            && wp.entry.source == target_entry.source
+                            && wp.entry.scaling_mode == target_entry.scaling_mode
+                            && wp.entry.filter_method == target_entry.filter_method
+                        {
+                            wp.entry.rotation_frequency = target_entry.rotation_frequency;
+                            wp.reconcile_timer();
+                        } else {
+                            wp.entry = target_entry;
+                            wp.load_images();
+                            wp.watch_source(self.source_tx.clone());
+                            wp.clear_image();
+                        }
+                    }
+                    wp
+                } else {
+                    Wallpaper::new(
+                        target_entry,
+                        self.qh.clone(),
+                        self.loop_handle.clone(),
+                        self.source_tx.clone(),
+                    )
+                };
+
+                if let Some(pos) = existing_layers.iter().position(|l| &l.wl_output == output) {
+                    let mut layer = existing_layers.remove(pos);
+                    layer.output_info = output_info;
+                    wp.layers.push(layer);
+                } else {
+                    let layer = self.new_layer(output.clone(), output_info);
+                    wp.layers.push(layer);
+                }
+
+                _ = wp.save_state();
+                wp.draw(&mut self.image_cache);
+                new_wallpapers.push(wp);
+            }
+
+            self.wallpapers = new_wallpapers;
+        }
     }
 
     #[must_use]
@@ -339,27 +392,30 @@ impl CosmicBg {
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
 
-        if let Some(session_lock_layer_manager) = &self.session_lock_layer_manager {
-            if let sctk::shell::wlr_layer::SurfaceKind::Wlr(surface) = layer.kind() {
-                session_lock_layer_manager.set_show_on_lock(surface);
-            }
+        if let Some(session_lock_layer_manager) = &self.session_lock_layer_manager
+            && let sctk::shell::wlr_layer::SurfaceKind::Wlr(surface) = layer.kind()
+        {
+            session_lock_layer_manager.set_show_on_lock(surface);
         }
 
         surface.commit();
 
         let viewport = self.viewporter.get_viewport(&surface, &self.qh, ());
 
-        let fractional_scale = if let Some(mngr) = self.fractional_scale_manager.as_ref() {
-            mngr.get_fractional_scale(&surface, &self.qh, surface.downgrade());
-            None
-        } else {
-            (self.compositor_state.wl_compositor().version() < 6)
-                .then_some(output_info.scale_factor as u32 * 120)
-        };
+        let (fractional_scale_handle, fractional_scale) =
+            if let Some(mngr) = self.fractional_scale_manager.as_ref() {
+                let scale_obj = mngr.get_fractional_scale(&surface, &self.qh, surface.downgrade());
+                (Some(scale_obj), None)
+            } else {
+                let scale = (self.compositor_state.wl_compositor().version() < 6)
+                    .then_some(output_info.scale_factor as u32 * 120);
+                (None, scale)
+            };
 
         CosmicBgLayer {
             layer,
             viewport,
+            fractional_scale_handle,
             wl_output: output,
             output_info,
             size: None,
@@ -385,8 +441,12 @@ impl CompositorHandler for CosmicBg {
                     .iter_mut()
                     .find(|layer| layer.layer.wl_surface() == surface)
                 {
-                    layer.fractional_scale = Some(new_factor as u32 * 120);
-                    wallpaper.draw();
+                    let new_scale = new_factor as u32 * 120;
+                    if layer.fractional_scale != Some(new_scale) {
+                        layer.fractional_scale = Some(new_scale);
+                        layer.needs_redraw = true;
+                        wallpaper.draw(&mut self.image_cache);
+                    }
                     break;
                 }
             }
@@ -442,28 +502,10 @@ impl OutputHandler for CosmicBg {
         _qh: &QueueHandle<Self>,
         wl_output: wl_output::WlOutput,
     ) {
-        self.active_outputs.push(wl_output.clone());
-        let Some(output_info) = self.output_state.info(&wl_output) else {
-            return;
-        };
-
-        if let Some(pos) = self
-            .wallpapers
-            .iter()
-            .position(|w| match w.entry.output.as_str() {
-                "all" => !w.layers.iter().any(|l| l.wl_output == wl_output),
-                name => {
-                    Some(name) == output_info.name.as_deref()
-                        && !w.layers.iter().any(|l| l.wl_output == wl_output)
-                }
-            })
-        {
-            let layer = self.new_layer(wl_output, output_info);
-            self.wallpapers[pos].layers.push(layer);
-            if let Err(err) = self.wallpapers[pos].save_state() {
-                tracing::error!("{err}");
-            }
+        if !self.active_outputs.contains(&wl_output) {
+            self.active_outputs.push(wl_output);
         }
+        self.apply_backgrounds();
     }
 
     fn update_output(
@@ -484,8 +526,12 @@ impl OutputHandler for CosmicBg {
                     .iter_mut()
                     .find(|layer| layer.wl_output == output)
                 {
-                    layer.fractional_scale = Some(output_info.scale_factor as u32 * 120);
-                    wallpaper.draw();
+                    let new_scale = output_info.scale_factor as u32 * 120;
+                    if layer.fractional_scale != Some(new_scale) {
+                        layer.fractional_scale = Some(new_scale);
+                        layer.needs_redraw = true;
+                        wallpaper.draw(&mut self.image_cache);
+                    }
                     break;
                 }
             }
@@ -514,26 +560,13 @@ impl OutputHandler for CosmicBg {
             }
         }
 
-        let Some(output_wallpaper) =
-            self.wallpapers
-                .iter_mut()
-                .find(|w| match w.entry.output.as_str() {
-                    "all" => true,
-                    name => Some(name) == output_info.name.as_deref(),
-                })
-        else {
-            return;
-        };
+        for wp in &mut self.wallpapers {
+            wp.layers.retain(|l| l.wl_output != output);
+        }
 
-        let Some(layer_position) = output_wallpaper
-            .layers
-            .iter()
-            .position(|bg_layer| bg_layer.wl_output == output)
-        else {
-            return;
-        };
-
-        output_wallpaper.layers.remove(layer_position);
+        if !self.config.same_on_all {
+            self.wallpapers.retain(|w| !w.layers.is_empty());
+        }
     }
 }
 
@@ -568,13 +601,27 @@ impl LayerShellHandler for CosmicBg {
                 w_layer.size = Some((w, h));
                 w_layer.needs_redraw = true;
 
+                let is_solid = matches!(
+                    wallpaper.current_source,
+                    Some(cosmic_bg_config::Source::Color(
+                        cosmic_bg_config::Color::Single(_)
+                    ))
+                );
+                let required_pool_size = if is_solid {
+                    4
+                } else {
+                    w as usize * h as usize * 4
+                };
+
                 if let Some(pool) = w_layer.pool.as_mut() {
-                    if let Err(why) = pool.resize(w as usize * h as usize * 4) {
+                    if pool.len() < required_pool_size
+                        && let Err(why) = pool.resize(required_pool_size)
+                    {
                         tracing::error!(?why, "failed to resize pool");
                         continue;
                     }
                 } else {
-                    match SlotPool::new(w as usize * h as usize * 4, &self.shm_state) {
+                    match SlotPool::new(required_pool_size, &self.shm_state) {
                         Ok(pool) => {
                             w_layer.pool.replace(pool);
                         }
@@ -586,7 +633,7 @@ impl LayerShellHandler for CosmicBg {
                     }
                 }
 
-                wallpaper.draw();
+                wallpaper.draw(&mut self.image_cache);
 
                 break;
             }
@@ -630,8 +677,11 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, Weak<wl_surface::WlSu
                             .iter_mut()
                             .find(|layer| layer.layer.wl_surface() == &surface)
                         {
-                            layer.fractional_scale = Some(scale);
-                            wallpaper.draw();
+                            if layer.fractional_scale != Some(scale) {
+                                layer.fractional_scale = Some(scale);
+                                layer.needs_redraw = true;
+                                wallpaper.draw(&mut state.image_cache);
+                            }
                             break;
                         }
                     }
