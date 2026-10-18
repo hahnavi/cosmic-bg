@@ -57,7 +57,7 @@ pub fn layer_surface(
     layer
         .layer
         .wl_surface()
-        .frame(queue_handle, wl_surface.clone());
+        .frame(queue_handle, crate::FrameCallbackData(wl_surface.clone()));
 
     // Attach and commit to present.
     if let Err(why) = buffer.attach_to(wl_surface) {

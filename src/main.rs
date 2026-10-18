@@ -38,7 +38,7 @@ use cosmic_config::CosmicConfigEntry;
 use cosmic_config::calloop::ConfigWatchSource;
 use cosmic_protocols::session_lock_layer::v1::client::cosmic_session_lock_layer_manager_v1;
 use eyre::Context;
-use sctk::compositor::{CompositorHandler, CompositorState};
+use sctk::compositor::{CompositorHandler, CompositorState, FrameCallbackData};
 use sctk::output::{OutputHandler, OutputInfo, OutputState};
 use sctk::reexports::calloop;
 use sctk::reexports::calloop_wayland_source::WaylandSource;
@@ -58,10 +58,7 @@ use sctk::shell::wlr_layer::{
 };
 use sctk::shm::slot::SlotPool;
 use sctk::shm::{Shm, ShmHandler};
-use sctk::{
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
-    registry_handlers,
-};
+use sctk::{delegate_registry, registry_handlers};
 
 use tracing::error;
 use tracing_subscriber::prelude::*;
@@ -647,11 +644,8 @@ impl ShmHandler for CosmicBg {
     }
 }
 
-delegate_compositor!(CosmicBg);
-delegate_output!(CosmicBg);
-delegate_shm!(CosmicBg);
-delegate_layer!(CosmicBg);
 delegate_registry!(CosmicBg);
+sctk::delegate_dispatch2!(CosmicBg);
 delegate_noop!(CosmicBg: wp_viewporter::WpViewporter);
 delegate_noop!(CosmicBg: wp_viewport::WpViewport);
 delegate_noop!(CosmicBg: wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1);
